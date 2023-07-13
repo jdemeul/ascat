@@ -6,9 +6,11 @@
 #' @param ASCATobj an ASCAT object
 #' @param ascat.gg germline genotypes (NULL if germline data is available)
 #' @param penalty penalty of introducing an additional ASPCF breakpoint (expert parameter, don't adapt unless you know what you are doing)
+#' @param out.dir directory in which output files will be written. Can be set to NA to not write PCFed files.
 #' @param wsample Vector of length length(ASCATobj$samples). Can be used to assign different weights to samples, for example to account for differences in sequencing quality. (Default = NULL)
 #' @param selectAlg Set to "exact" to run the exact algorithm, or "fast" to run the heuristic algorithm. (Default = "exact")
 #' @param refine Logical. Should breakpoints be refined on a per sample base? Otherwise each breakpoint is assumed to be present in each sample. (Default = TRUE)
+#' @param seed A seed to be set when subsampling SNPs for X in males (optional, default=as.integer(Sys.time())).
 #' 
 #' @details This function saves the results in in [sample].LogR.PCFed.txt and [sample].BAF.PCFed.txt
 #' 
@@ -25,9 +27,9 @@
 #' 
 #' @export
 #'
-ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 25, wsample=NULL,
-                       selectAlg="exact",refine=TRUE) {
-  
+ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 70, out.dir = ".", wsample=NULL, selectAlg="exact",refine=TRUE, seed=as.integer(Sys.time())) {
+  if (is.null(ASCATobj$isTargetedSeq)) ASCATobj$isTargetedSeq=F
+  set.seed(seed)
   useLogRonlySites=TRUE
   #first, set germline genotypes
   gg = NULL
@@ -35,6 +37,30 @@ ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 25, wsample=NU
     gg = ascat.gg$germlinegenotypes
   } else {
     gg = ASCATobj$Germline_BAF < 0.3 | ASCATobj$Germline_BAF > 0.7
+  }
+  
+  # in asmultipcf, we're expecting one germline (could be multiple germlines but we're only using the first one)
+  if (ncol(gg)>1) gg=gg[,1]
+  # specific process for nonPAR in males
+  if (!is.null(ASCATobj$X_nonPAR) && ASCATobj$gender[1]=='XY') {
+    # select SNPs with non-NA BAF values in nonPAR region
+    nonPAR_index=which(ASCATobj$SNPpos[,1] %in% c('chrX','X') & ASCATobj$SNPpos[,2]>=ASCATobj$X_nonPAR[1] & ASCATobj$SNPpos[,2]<=ASCATobj$X_nonPAR[2] & !is.na(gg))
+    # store hmz/htz information for autosomes
+    autosomes_info=table(gg[which(ASCATobj$SNPpos[,1] %in% setdiff(ASCATobj$chrs,ASCATobj$sexchromosomes))])
+    if (length(nonPAR_index)>5) {
+      # set all to hmz
+      gg[nonPAR_index]=T
+      if (!is.null(ASCATobj$Germline_BAF)) {
+        # compute distance to BAF=0/1
+        DIST=1-sapply(ASCATobj$Germline_BAF[nonPAR_index,1],function(x) {if (x>0.5) return(x) else return(1-x)})
+        # select X% (derived from autosomes) of SNPs based on closest distance to BAF=0/1 and force those to be considered for ASPCF
+        gg[nonPAR_index[which(rank(DIST,ties.method='random')<=round(length(DIST)*(autosomes_info['FALSE']/sum(autosomes_info))))]]=F
+        rm(DIST)
+      } else {
+        gg[sample(nonPAR_index,round(length(nonPAR_index)*(autosomes_info['FALSE']/sum(autosomes_info))))]=F
+      }
+    }
+    rm(nonPAR_index,autosomes_info)
   }
   
   segmentlengths = unique(c(penalty,25,50,100,200,400,800))
@@ -115,7 +141,8 @@ ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 25, wsample=NU
             bafASPCF = bafwins
           } else {
             logRASPCF = apply(logRaveraged,2,function(x) rep(mean(x,na.rm=TRUE),length(x)))
-            bafASPCF = apply(bafwins,2,function(x) rep(mean(x,na.rm=TRUE),length(x)))
+            bafASPCF = apply(bafwins,2,function(x) rep(ifelse(mean(x,na.rm=TRUE)>=0.5,mean(x,na.rm=TRUE),1-mean(x,na.rm=TRUE)),length(x)))
+            if (ASCATobj$isTargetedSeq) apply(bafASPCF,2,function(x) ifelse(x<=0.55,0.5,x))
           }
         } else {
           # combine logR and BAF data into one matrix for joint segmentation
@@ -216,6 +243,7 @@ ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 25, wsample=NU
                 if(sqrt(sd^2+mu^2) < 2*sd){
                   mu <- 0
                 }
+                if (ASCATobj$isTargetedSeq && mu<=0.05) mu=0
                 yhat[frst[i]:last[i]] <- rep(mu+0.5,last[i]-frst[i]+1)
               }
             }
@@ -307,29 +335,20 @@ ascat.asmultipcf <- function(ASCATobj, ascat.gg = NULL, penalty = 25, wsample=NU
   Tumor_BAF_segmented <- list()
   
   for (sample in 1:length(ASCATobj$samples)) { 
-    logrfilename = paste(ASCATobj$samples[sample],".LogR.PCFed.txt",sep="")
-    baffilename = paste(ASCATobj$samples[sample],".BAF.PCFed.txt",sep="")
+    logrfilename = paste(out.dir,'/',ASCATobj$samples[sample],".LogR.PCFed.txt",sep="")
+    baffilename = paste(out.dir,'/',ASCATobj$samples[sample],".BAF.PCFed.txt",sep="")
     
     ## remove NAs from BAF data
     bafPCFed_sample <- bafPCFed[!is.na(bafPCFed[,sample]),sample,drop=FALSE]
     Tumor_BAF_segmented[[sample]] <- 1-bafPCFed_sample
     
-    write.table(logRPCFed[,sample],logrfilename,sep="\t",col.names=F,quote=F)
-    write.table(bafPCFed_sample,baffilename,sep="\t",col.names=F,quote=F)
+    if (!is.na(out.dir)) write.table(logRPCFed[,sample],logrfilename,sep="\t",col.names=F,quote=F)
+    if (!is.na(out.dir)) write.table(bafPCFed_sample,baffilename,sep="\t",col.names=F,quote=F)
   }
   
-  ASCATobj = list(Tumor_LogR = ASCATobj$Tumor_LogR,
-                  Tumor_BAF = ASCATobj$Tumor_BAF,
-                  Tumor_LogR_segmented = logRPCFed,
-                  Tumor_BAF_segmented = Tumor_BAF_segmented,
-                  Germline_LogR = ASCATobj$Germline_LogR,
-                  Germline_BAF = ASCATobj$Germline_BAF,
-                  SNPpos = ASCATobj$SNPpos,
-                  ch = ASCATobj$ch,
-                  chr = ASCATobj$chr,
-                  chrs = ASCATobj$chrs,
-                  samples = colnames(ASCATobj$Tumor_LogR), gender = ASCATobj$gender,
-                  sexchromosomes = ASCATobj$sexchromosomes, failedarrays = ascat.gg$failedarrays)
+  ASCATobj$Tumor_LogR_segmented=logRPCFed
+  ASCATobj$Tumor_BAF_segmented=Tumor_BAF_segmented
+  ASCATobj$failedarrays=ascat.gg$failedarrays
   return(ASCATobj)
 
 }
